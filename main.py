@@ -1,13 +1,17 @@
+import json
 import io
 import time
+import os
+import sys
+import traceback
+
 import numpy as np
 import torch
 import torch.nn as nn
 from flask import Flask, request, jsonify
 import mysql.connector
-import os
-import sys
-import traceback
+# Optional GCS client
+from google.cloud import storage
 
 # -----------------------------------------
 # Configuration
@@ -15,17 +19,17 @@ import traceback
 DB_USER          = os.environ.get("DB_USER", "appuser")
 DB_PASS          = os.environ.get("DB_PASS", "secure_app_password")
 DB_NAME          = os.environ.get("DB_NAME", "myappdb")
-DB_SOCKET        = os.environ.get("DB_SOCKET")            # e.g. "/cloudsql/project:region:instance"
+DB_SOCKET        = os.environ.get("DB_SOCKET")
 CLICK_MODEL_PATH = os.environ.get("CLICK_MODEL_PATH", "/app/click_model.pt")
-EMB_DIM          = int(os.environ.get("EMB_DIM", 128))      # GCN embedding dim
-SENT_DIM         = int(os.environ.get("SENT_DIM", 384))     # sentence_embedding dim
-CAT_DIM_USER     = int(os.environ.get("CAT_DIM_USER", 32))  # user category_vec dim
-CAT_DIM_ISSUE    = int(os.environ.get("CAT_DIM_ISSUE", 32)) # issue category_vec dim
+EMB_DIM          = int(os.environ.get("EMB_DIM", 128))
+SENT_DIM         = int(os.environ.get("SENT_DIM", 384))
+CAT_DIM_USER     = int(os.environ.get("CAT_DIM_USER", 32))
+CAT_DIM_ISSUE    = int(os.environ.get("CAT_DIM_ISSUE", 32))
 NEG_RATIO        = int(os.environ.get("NEG_RATIO", 3))
 BATCH_SIZE       = int(os.environ.get("BATCH_SIZE", 64))
 NUM_EPOCHS       = int(os.environ.get("NUM_EPOCHS", 5))
 LEARNING_RATE    = float(os.environ.get("LEARNING_RATE", 1e-3))
-GCS_BUCKET       = os.environ.get("GCS_BUCKET")             # Optional: GCS bucket for model storage
+GCS_BUCKET       = os.environ.get("GCS_BUCKET")
 GCS_MODEL_PATH   = os.environ.get("GCS_MODEL_PATH", "models/click_model.pt")
 
 # Device 설정 (GPU 우선)
@@ -33,47 +37,38 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[INFO] Using device: {device}")
 
 # -----------------------------------------
-# Database helper
+# DB helper
 # -----------------------------------------
 def get_db_connection():
     try:
         if DB_SOCKET:
             return mysql.connector.connect(
-                user=DB_USER,
-                password=DB_PASS,
-                database=DB_NAME,
-                unix_socket=DB_SOCKET
-            )
+                user=DB_USER, password=DB_PASS,
+                database=DB_NAME, unix_socket=DB_SOCKET)
         return mysql.connector.connect(
-            user=DB_USER,
-            password=DB_PASS,
-            database=DB_NAME,
-            host="127.0.0.1",
-            port=3306
-        )
+            user=DB_USER, password=DB_PASS,
+            database=DB_NAME, host="127.0.0.1", port=3306)
     except mysql.connector.Error:
         traceback.print_exc(file=sys.stderr)
         raise
 
-def load_ndarray(blob: bytes) -> np.ndarray:
+def load_ndarray(blob: bytes):
     if not blob:
         return None
     buf = io.BytesIO(blob)
     return np.load(buf, allow_pickle=False)
 
 # -----------------------------------------
-# Model Definition
+# Model definition
 # -----------------------------------------
 class ClickMLP(nn.Module):
     def __init__(self, input_dim, hidden_dims=None):
         super().__init__()
-        if hidden_dims is None:
-            hidden_dims = [256, 128]
+        hidden_dims = hidden_dims or [256, 128]
         layers = []
         dims = [input_dim] + hidden_dims
         for in_dim, out_dim in zip(dims, dims[1:]):
-            layers.append(nn.Linear(in_dim, out_dim))
-            layers.append(nn.ReLU())
+            layers += [nn.Linear(in_dim, out_dim), nn.ReLU()]
         layers.append(nn.Linear(dims[-1], 1))
         self.net = nn.Sequential(*layers)
 
@@ -81,9 +76,8 @@ class ClickMLP(nn.Module):
         return torch.sigmoid(self.net(x)).squeeze(-1)
 
 # -----------------------------------------
-# GCS Helpers (optional)
+# GCS helpers
 # -----------------------------------------
-from google.cloud import storage
 
 def upload_to_gcs(local_path, bucket_name, blob_path):
     client = storage.Client()
@@ -96,164 +90,128 @@ def download_from_gcs(local_path, bucket_name, blob_path):
     bucket.blob(blob_path).download_to_filename(local_path)
 
 # -----------------------------------------
-# Train & Save Model Function
+# Model load utility
+# -----------------------------------------
+model = None
+
+def load_model():
+    global model
+    # skip if already loaded
+    if model is not None:
+        return True
+    # download if GCS configured
+    if GCS_BUCKET:
+        try:
+            download_from_gcs(CLICK_MODEL_PATH, GCS_BUCKET, GCS_MODEL_PATH)
+        except Exception as e:
+            print(f"[WARN] Model download failed: {e}")
+    # load if exists
+    if os.path.exists(CLICK_MODEL_PATH):
+        try:
+            input_dim = 2*EMB_DIM + CAT_DIM_USER + SENT_DIM + CAT_DIM_ISSUE
+            m = ClickMLP(input_dim=input_dim).to(device)
+            m.load_state_dict(torch.load(CLICK_MODEL_PATH, map_location=device))
+            m.eval()
+            model = m
+            print("[INFO] Model loaded.")
+            return True
+        except Exception as e:
+            print(f"[ERROR] Model load failed: {e}")
+    else:
+        print(f"[INFO] No model file at {CLICK_MODEL_PATH}")
+    return False
+
+# -----------------------------------------
+# Train & save model
 # -----------------------------------------
 def train_and_save_model():
-    # Load training data
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    # Users: gcn_vec + category_vec
-    cursor.execute("SELECT id, gcn_vec, category_vec FROM users")
-    users = {uid: (load_ndarray(g), load_ndarray(c)) for uid, g, c in cursor.fetchall()}
-    # Issues: gcn_vec, sentence_embedding, category_vec
-    cursor.execute("SELECT id, gcn_vec, sentence_embedding, category_vec FROM issues")
-    issues = {iid: (load_ndarray(g), load_ndarray(s), load_ndarray(c)) for iid, g, s, c in cursor.fetchall()}
-    # Positive clicks
-    cursor.execute("SELECT user_id, issue_id FROM custom_events WHERE eventname='click'")
-    positives = set(cursor.fetchall())
-    conn.close()
-
-    # Build samples
+    # prepare data
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("SELECT id, gcn_vec, category_vec FROM users")
+    users = {uid: (load_ndarray(g), load_ndarray(c)) for uid,g,c in cur.fetchall()}
+    cur.execute("SELECT id, gcn_vec, sentence_embedding, category_vec FROM issues")
+    issues = {iid: (load_ndarray(g), load_ndarray(s), load_ndarray(c)) for iid,g,s,c in cur.fetchall()}
+    cur.execute("SELECT user_id, issue_id FROM custom_events WHERE eventname='click'")
+    positives = set(cur.fetchall()); conn.close()
     X_list, y_list = [], []
-    for uid, iid in positives:
-        u_g, u_c = users.get(uid, (None, None))
-        i_g, i_s, i_c = issues.get(iid, (None, None, None))
-        if u_c is None or i_s is None:
-            continue
-        # Handle missing GCN embeddings
+    for uid,iid in positives:
+        u_g, u_c = users.get(uid,(None,None))
+        i_g, i_s, i_c = issues.get(iid,(None,None,None))
+        if u_c is None or i_s is None: continue
         u_g = u_g if u_g is not None else np.zeros(EMB_DIM)
         i_g = i_g if i_g is not None else np.zeros(EMB_DIM)
         i_c = i_c if i_c is not None else np.zeros(CAT_DIM_ISSUE)
-        feat = np.concatenate([u_g, u_c, i_g, i_s, i_c], axis=0)
-        X_list.append(feat); y_list.append(1)
-        # Negative sampling
+        X_list.append(np.concatenate([u_g,u_c,i_g,i_s,i_c])); y_list.append(1)
         for _ in range(NEG_RATIO):
-            neg_iid = np.random.choice(list(issues.keys()))
-            if (uid, neg_iid) in positives: continue
-            ng_g, ng_s, ng_c = issues[neg_iid]
-            ng_g = ng_g if ng_g is not None else np.zeros(EMB_DIM)
-            ng_c = ng_c if ng_c is not None else np.zeros(CAT_DIM_ISSUE)
-            neg_feat = np.concatenate([u_g, u_c, ng_g, ng_s, ng_c], axis=0)
-            X_list.append(neg_feat); y_list.append(0)
-
-    X = torch.tensor(np.stack(X_list), dtype=torch.float32)
-    y = torch.tensor(y_list, dtype=torch.float32)
+            nid = np.random.choice(list(issues));
+            if (uid,nid) in positives: continue
+            ng,ns,nc = issues[nid]
+            ng = ng if ng is not None else np.zeros(EMB_DIM)
+            nc = nc if nc is not None else np.zeros(CAT_DIM_ISSUE)
+            X_list.append(np.concatenate([u_g,u_c,ng,ns,nc])); y_list.append(0)
+    X = torch.tensor(np.stack(X_list),float32=True); y=torch.tensor(y_list,float32=True)
     from torch.utils.data import DataLoader, TensorDataset
-    loader = DataLoader(TensorDataset(X, y), batch_size=BATCH_SIZE, shuffle=True)
-
-    # Train MLP
-    input_dim = 2*EMB_DIM + CAT_DIM_USER + SENT_DIM + CAT_DIM_ISSUE
-    model = ClickMLP(input_dim=input_dim).to(device)
-    criterion = nn.BCELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    model.train()
-    for epoch in range(NUM_EPOCHS):
-        total_loss = 0
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            preds = model(xb)
-            loss = criterion(preds, yb)
-            optimizer.zero_grad(); loss.backward(); optimizer.step()
-            total_loss += loss.item()
-        print(f"Epoch {epoch+1}/{NUM_EPOCHS} - loss: {total_loss/len(loader):.4f}")
-
-    # Save locally
-    torch.save(model.state_dict(), CLICK_MODEL_PATH)
-    print(f"Model saved to {CLICK_MODEL_PATH}")
-    # Upload to GCS if configured
-    if GCS_BUCKET:
-        upload_to_gcs(CLICK_MODEL_PATH, GCS_BUCKET, GCS_MODEL_PATH)
-        print(f"Uploaded to gs://{GCS_BUCKET}/{GCS_MODEL_PATH}")
-
-# -----------------------------------------
-# Initialize or Skip Inference Model
-# -----------------------------------------
-model = None
-# Attempt download if GCS configured
-if GCS_BUCKET:
-    try:
-        download_from_gcs(CLICK_MODEL_PATH, GCS_BUCKET, GCS_MODEL_PATH)
-    except Exception as e:
-        print(f"[WARN] Could not download model from GCS: {e}")
-# Load model if exists
-if os.path.exists(CLICK_MODEL_PATH):
-    try:
-        input_dim = 2*EMB_DIM + CAT_DIM_USER + SENT_DIM + CAT_DIM_ISSUE
-        model = ClickMLP(input_dim=input_dim).to(device)
-        model.load_state_dict(torch.load(CLICK_MODEL_PATH, map_location=device))
-        model.eval()
-        print("[INFO] Model loaded successfully.")
-    except Exception as e:
-        print(f"[ERROR] Failed to load model: {e}")
-else:
-    print(f"[WARN] No model file at {CLICK_MODEL_PATH}. Please train first.")
+    loader = DataLoader(TensorDataset(X,y), batch_size=BATCH_SIZE, shuffle=True)
+    input_dim=2*EMB_DIM+CAT_DIM_USER+SENT_DIM+CAT_DIM_ISSUE
+    m = ClickMLP(input_dim).to(device)
+    opt=torch.optim.Adam(m.parameters(),lr=LEARNING_RATE); loss_fn=nn.BCELoss()
+    m.train()
+    for e in range(NUM_EPOCHS):
+        tot=0
+        for xb,yb in loader:
+            xb,yb=xb.to(device),yb.to(device)
+            p=m(xb); l=loss_fn(p,yb)
+            opt.zero_grad();l.backward();opt.step();tot+=l.item()
+        print(f"Epoch{e+1}/{NUM_EPOCHS} loss={tot/len(loader):.4f}")
+    torch.save(m.state_dict(),CLICK_MODEL_PATH);
+    print("Model saved")
+    if GCS_BUCKET: upload_to_gcs(CLICK_MODEL_PATH,GCS_BUCKET,GCS_MODEL_PATH)
+    # reload into memory
+    load_model()
 
 # -----------------------------------------
 # Flask app
 # -----------------------------------------
-app = Flask(__name__)
+app=Flask(__name__)
 
-@app.route('/train-model', methods=['POST'])
+@app.route('/train-model',methods=['POST'])
 def train_route():
     try:
         train_and_save_model()
-        # Reload model after training
-        global model
-        input_dim = 2*EMB_DIM + CAT_DIM_USER + SENT_DIM + CAT_DIM_ISSUE
-        model = ClickMLP(input_dim=input_dim).to(device)
-        model.load_state_dict(torch.load(CLICK_MODEL_PATH, map_location=device))
-        model.eval()
-        return jsonify({"message": "training complete"}), 200
+        return jsonify({"message":"training complete"}),200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error":str(e)}),500
 
-@app.route('/set-recommand', methods=['POST'])
+@app.route('/set-recommand',methods=['POST'])
 def recommend_route():
-    if model is None:
-        return jsonify({"error": "No model loaded. Please train via /train-model first."}), 503
-    conn = get_db_connection(); cursor = conn.cursor()
-    # Load data
-    cursor.execute("SELECT id, gcn_vec, category_vec FROM users")
-    users = {uid: (load_ndarray(g), load_ndarray(c)) for uid, g, c in cursor.fetchall()}
-    cursor.execute("SELECT id, gcn_vec, sentence_embedding, category_vec FROM issues")
-    issues = {iid: (load_ndarray(g), load_ndarray(s), load_ndarray(c)) for iid, g, s, c in cursor.fetchall()}
-
-    # Clear existing recommendations
-    cursor.execute("DELETE FROM user_recommendations")
-
-    recs = []
-    for uid, (u_g, u_c) in users.items():
-        if u_c is None:
-            continue
-        feats, iids = [], []
-        for iid, (i_g, i_s, i_c) in issues.items():
-            if i_s is None:
-                continue
-            u_gv = u_g if u_g is not None else np.zeros(EMB_DIM)
-            i_gv = i_g if i_g is not None else np.zeros(EMB_DIM)
-            i_cv = i_c if i_c is not None else np.zeros(CAT_DIM_ISSUE)
-            feat = np.concatenate([u_gv, u_c, i_gv, i_s, i_cv], axis=0)
-            feats.append(feat); iids.append(iid)
-        if not feats:
-            continue
-        X = torch.tensor(np.stack(feats), dtype=torch.float32).to(device)
-        with torch.no_grad(): probs = model(X).cpu().numpy()
-        for iid, score in zip(iids, probs):
-            recs.append((uid, iid, float(score)))
-
+    if not load_model():
+        return jsonify({"error":"No model available"}),503
+    conn=get_db_connection();cur=conn.cursor()
+    cur.execute("DELETE FROM user_recommendations")
+    cur.execute("SELECT id,gcn_vec,category_vec FROM users"); users={uid:(load_ndarray(g),load_ndarray(c)) for uid,g,c in cur.fetchall()}
+    cur.execute("SELECT id,gcn_vec,sentence_embedding,category_vec FROM issues"); issues={iid:(load_ndarray(g),load_ndarray(s),load_ndarray(c)) for iid,g,s,c in cur.fetchall()}
+    recs=[]
+    for uid,(ug,uc) in users.items():
+        if uc is None: continue
+        feats,iids=[],[]
+        for iid,(ig,is_,ic) in issues.items():
+            if is_ is None: continue
+            ugv=ug if ug is not None else np.zeros(EMB_DIM)
+            igv=ig if ig is not None else np.zeros(EMB_DIM)
+            icv=ic if ic is not None else np.zeros(CAT_DIM_ISSUE)
+            feats.append(np.concatenate([ugv,uc,igv,is_,icv])); iids.append(iid)
+        if not feats: continue
+        X=torch.tensor(np.stack(feats),dtype=torch.float32).to(device)
+        with torch.no_grad(): ps=model(X).cpu().numpy()
+        for iid,sc in zip(iids,ps): recs.append((uid,iid,float(sc)))
     if recs:
-        cursor.executemany(
-            "INSERT INTO user_recommendations (user_id, issue_id, score)"
-            " VALUES (%s, %s, %s)"
-            " ON DUPLICATE KEY UPDATE score = VALUES(score), updated_at = CURRENT_TIMESTAMP",
-            recs
-        )
+        cur.executemany("INSERT INTO user_recommendations(user_id,issue_id,score) VALUES(%s,%s,%s) "
+                        "ON DUPLICATE KEY UPDATE score=VALUES(score),updated_at=CURRENT_TIMESTAMP",recs)
+    conn.commit();cur.close();conn.close()
+    return jsonify({"message":"recommendations updated"}),200
 
-    conn.commit(); cursor.close(); conn.close()
-    return jsonify({"message": "recommendations updated"}), 200
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+if __name__=='__main__':
+    app.run(host='0.0.0.0',port=int(os.environ.get('PORT',8080)))
 
 from GCN_embedding import user_item_GCN_embedding
 
@@ -261,13 +219,6 @@ def arr_to_blob(arr: np.ndarray) -> bytes:
     buf = io.BytesIO()
     np.save(buf, arr)
     return buf.getvalue()
-
-
-def load_ndarray(blob: bytes) -> np.ndarray:
-    if not blob:
-        return None
-    buf = io.BytesIO(blob)
-    return np.load(buf, allow_pickle=False)
 
 @app.route('/gcn-embedd', methods=['POST'])
 def set_gcn_embedding():
