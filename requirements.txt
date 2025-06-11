@@ -1,0 +1,5 @@
+flask
+gunicorn
+mysql-connector-python
+torch>=2.0
+numpy
