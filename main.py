@@ -234,5 +234,51 @@ def recommend_route():
 
     return jsonify({"message": "recommendations updated", "version": version}), 200
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+from GCN_embedding import user_item_GCN_embedding
+
+def arr_to_blob(arr: np.ndarray) -> bytes:
+    buf = io.BytesIO()
+    np.save(buf, arr)
+    return buf.getvalue()
+
+
+def load_ndarray(blob: bytes) -> np.ndarray:
+    if not blob:
+        return None
+    buf = io.BytesIO(blob)
+    return np.load(buf, allow_pickle=False)
+
+@app.route('/gcn-embedd', methods=['POST'])
+def set_gcn_embedding():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT id FROM users")
+    rows = cursor.fetchall()
+    user_ids = [row[0] for row in rows]
+
+    cursor.execute("SELECT id FROM issues")
+    rows = cursor.fetchall()
+    issue_ids = [row[0] for row in rows]
+
+    cursor.execute("SELECT user_id, issue_id FROM custom_events WHERE eventname = %s", ("click",))
+    rows = cursor.fetchall()
+
+    raw_edges = rows
+
+    user_vec, issue_vec = user_item_GCN_embedding(user_ids=user_ids, item_ids=issue_ids, raw_edges=raw_edges)
+
+    user_data = [(arr_to_blob(user_vec[uid]), uid) for uid in user_ids]
+    cursor.executemany("UPDATE users SET gcn_vec=%s WHERE id=%s", user_data)
+
+    issue_data = [(arr_to_blob(issue_vec[iid]), iid) for iid in issue_ids]
+    cursor.executemany("UPDATE issues SET gcn_vec=%s WHERE id=%s", issue_data)
+
+    conn.commit()
+    
+    cursor.close()
+    conn.close()
+
+    return jsonify({
+        "message" : "everything ok my man"
+    }), 200
