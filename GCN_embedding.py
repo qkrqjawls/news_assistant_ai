@@ -5,6 +5,9 @@ from torch_geometric.data import Data
 from sklearn.preprocessing import LabelEncoder
 import numpy as np
 import random
+import os
+
+EMB_DIM   = os.environ.get("EMB_DIM", 128)  # GCN 임베딩 차원 (user + item embedding length = 2*EMB_DIM)
 
 
 def user_item_GCN_embedding(user_ids : list, item_ids : list, raw_edges : list): # return (user id->vec(ndarray) 딕셔너리, item id->vec 딕셔너리) 튜플
@@ -34,7 +37,7 @@ def user_item_GCN_embedding(user_ids : list, item_ids : list, raw_edges : list):
 
     # 2. 노드 특징 초기화: (유저 수 + 아이템 수) × 특징 차원
     # 여기서는 랜덤 초기화하지만 실제로는 ID 임베딩이나 기타 특징을 사용할 수 있습니다.
-    node_features_dim = 16
+    node_features_dim = EMB_DIM
     x = torch.randn((num_nodes, node_features_dim))
 
     data = Data(x=x, edge_index=edge_index)
