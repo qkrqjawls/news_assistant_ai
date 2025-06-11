@@ -1,4 +1,3 @@
-import json
 import io
 import time
 import numpy as np
@@ -13,21 +12,21 @@ import traceback
 # -----------------------------------------
 # Configuration
 # -----------------------------------------
-DB_USER         = os.environ.get("DB_USER", "appuser")
-DB_PASS         = os.environ.get("DB_PASS", "secure_app_password")
-DB_NAME         = os.environ.get("DB_NAME", "myappdb")
-DB_SOCKET       = os.environ.get("DB_SOCKET")            # e.g. "/cloudsql/project:region:instance"
-CLICK_MODEL_PATH= os.environ.get("CLICK_MODEL_PATH", "/app/click_model.pt")
-EMB_DIM         = int(os.environ.get("EMB_DIM", 128))      # GCN embedding dim
-SENT_DIM        = int(os.environ.get("SENT_DIM", 384))     # sentence_embedding dim
-CAT_DIM_USER    = int(os.environ.get("CAT_DIM_USER", 12))  # user category_vec dim
-CAT_DIM_ISSUE   = int(os.environ.get("CAT_DIM_ISSUE", 12)) # issue category_vec dim
-NEG_RATIO       = int(os.environ.get("NEG_RATIO", 3))
-BATCH_SIZE      = int(os.environ.get("BATCH_SIZE", 64))
-NUM_EPOCHS      = int(os.environ.get("NUM_EPOCHS", 5))
-LEARNING_RATE   = float(os.environ.get("LEARNING_RATE", 1e-3))
-GCS_BUCKET      = os.environ.get("GCS_BUCKET")             # Optional: GCS bucket
-GCS_MODEL_PATH  = os.environ.get("GCS_MODEL_PATH", "models/click_model.pt")
+DB_USER          = os.environ.get("DB_USER", "appuser")
+DB_PASS          = os.environ.get("DB_PASS", "secure_app_password")
+DB_NAME          = os.environ.get("DB_NAME", "myappdb")
+DB_SOCKET        = os.environ.get("DB_SOCKET")            # e.g. "/cloudsql/project:region:instance"
+CLICK_MODEL_PATH = os.environ.get("CLICK_MODEL_PATH", "/app/click_model.pt")
+EMB_DIM          = int(os.environ.get("EMB_DIM", 128))      # GCN embedding dim
+SENT_DIM         = int(os.environ.get("SENT_DIM", 384))     # sentence_embedding dim
+CAT_DIM_USER     = int(os.environ.get("CAT_DIM_USER", 32))  # user category_vec dim
+CAT_DIM_ISSUE    = int(os.environ.get("CAT_DIM_ISSUE", 32)) # issue category_vec dim
+NEG_RATIO        = int(os.environ.get("NEG_RATIO", 3))
+BATCH_SIZE       = int(os.environ.get("BATCH_SIZE", 64))
+NUM_EPOCHS       = int(os.environ.get("NUM_EPOCHS", 5))
+LEARNING_RATE    = float(os.environ.get("LEARNING_RATE", 1e-3))
+GCS_BUCKET       = os.environ.get("GCS_BUCKET")             # Optional: GCS bucket for model storage
+GCS_MODEL_PATH   = os.environ.get("GCS_MODEL_PATH", "models/click_model.pt")
 
 # Device 설정 (GPU 우선)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -39,14 +38,22 @@ print(f"[INFO] Using device: {device}")
 def get_db_connection():
     try:
         if DB_SOCKET:
-            return mysql.connector.connect(user=DB_USER, password=DB_PASS,
-                                           database=DB_NAME, unix_socket=DB_SOCKET)
-        return mysql.connector.connect(user=DB_USER, password=DB_PASS,
-                                       database=DB_NAME, host="127.0.0.1", port=3306)
+            return mysql.connector.connect(
+                user=DB_USER,
+                password=DB_PASS,
+                database=DB_NAME,
+                unix_socket=DB_SOCKET
+            )
+        return mysql.connector.connect(
+            user=DB_USER,
+            password=DB_PASS,
+            database=DB_NAME,
+            host="127.0.0.1",
+            port=3306
+        )
     except mysql.connector.Error:
         traceback.print_exc(file=sys.stderr)
         raise
-
 
 def load_ndarray(blob: bytes) -> np.ndarray:
     if not blob:
@@ -55,7 +62,7 @@ def load_ndarray(blob: bytes) -> np.ndarray:
     return np.load(buf, allow_pickle=False)
 
 # -----------------------------------------
-# Model definition
+# Model Definition
 # -----------------------------------------
 class ClickMLP(nn.Module):
     def __init__(self, input_dim, hidden_dims=None):
@@ -74,48 +81,52 @@ class ClickMLP(nn.Module):
         return torch.sigmoid(self.net(x)).squeeze(-1)
 
 # -----------------------------------------
-# GCS helpers (optional)
+# GCS Helpers (optional)
 # -----------------------------------------
 from google.cloud import storage
 
-def upload_to_gcs(local_path, bucket, blob_path):
+def upload_to_gcs(local_path, bucket_name, blob_path):
     client = storage.Client()
-    bucket = client.bucket(bucket)
+    bucket = client.bucket(bucket_name)
     bucket.blob(blob_path).upload_from_filename(local_path)
 
-def download_from_gcs(local_path, bucket, blob_path):
+def download_from_gcs(local_path, bucket_name, blob_path):
     client = storage.Client()
-    client.bucket(bucket).blob(blob_path).download_to_filename(local_path)
+    bucket = client.bucket(bucket_name)
+    bucket.blob(blob_path).download_to_filename(local_path)
 
 # -----------------------------------------
-# Train & Save Model
+# Train & Save Model Function
 # -----------------------------------------
 def train_and_save_model():
+    # Load training data
     conn = get_db_connection()
     cursor = conn.cursor()
-    # load users (gcn, category)
+    # Users: gcn_vec + category_vec
     cursor.execute("SELECT id, gcn_vec, category_vec FROM users")
     users = {uid: (load_ndarray(g), load_ndarray(c)) for uid, g, c in cursor.fetchall()}
-    # load issues (gcn, sentence, category)
+    # Issues: gcn_vec, sentence_embedding, category_vec
     cursor.execute("SELECT id, gcn_vec, sentence_embedding, category_vec FROM issues")
     issues = {iid: (load_ndarray(g), load_ndarray(s), load_ndarray(c)) for iid, g, s, c in cursor.fetchall()}
-    # positive clicks
+    # Positive clicks
     cursor.execute("SELECT user_id, issue_id FROM custom_events WHERE eventname='click'")
     positives = set(cursor.fetchall())
     conn.close()
 
-    # prepare training samples
+    # Build samples
     X_list, y_list = [], []
     for uid, iid in positives:
         u_g, u_c = users.get(uid, (None, None))
         i_g, i_s, i_c = issues.get(iid, (None, None, None))
         if u_c is None or i_s is None:
             continue
+        # Handle missing GCN embeddings
         u_g = u_g if u_g is not None else np.zeros(EMB_DIM)
         i_g = i_g if i_g is not None else np.zeros(EMB_DIM)
         i_c = i_c if i_c is not None else np.zeros(CAT_DIM_ISSUE)
         feat = np.concatenate([u_g, u_c, i_g, i_s, i_c], axis=0)
         X_list.append(feat); y_list.append(1)
+        # Negative sampling
         for _ in range(NEG_RATIO):
             neg_iid = np.random.choice(list(issues.keys()))
             if (uid, neg_iid) in positives: continue
@@ -130,7 +141,7 @@ def train_and_save_model():
     from torch.utils.data import DataLoader, TensorDataset
     loader = DataLoader(TensorDataset(X, y), batch_size=BATCH_SIZE, shuffle=True)
 
-    # train
+    # Train MLP
     input_dim = 2*EMB_DIM + CAT_DIM_USER + SENT_DIM + CAT_DIM_ISSUE
     model = ClickMLP(input_dim=input_dim).to(device)
     criterion = nn.BCELoss()
@@ -144,24 +155,38 @@ def train_and_save_model():
             loss = criterion(preds, yb)
             optimizer.zero_grad(); loss.backward(); optimizer.step()
             total_loss += loss.item()
-        print(f"Epoch {epoch+1}/{NUM_EPOCHS} loss={total_loss/len(loader):.4f}")
+        print(f"Epoch {epoch+1}/{NUM_EPOCHS} - loss: {total_loss/len(loader):.4f}")
 
-    # save model
+    # Save locally
     torch.save(model.state_dict(), CLICK_MODEL_PATH)
     print(f"Model saved to {CLICK_MODEL_PATH}")
+    # Upload to GCS if configured
     if GCS_BUCKET:
         upload_to_gcs(CLICK_MODEL_PATH, GCS_BUCKET, GCS_MODEL_PATH)
         print(f"Uploaded to gs://{GCS_BUCKET}/{GCS_MODEL_PATH}")
 
 # -----------------------------------------
-# Initialize inference model
+# Initialize or Skip Inference Model
 # -----------------------------------------
+model = None
+# Attempt download if GCS configured
 if GCS_BUCKET:
-    download_from_gcs(CLICK_MODEL_PATH, GCS_BUCKET, GCS_MODEL_PATH)
-input_dim = 2*EMB_DIM + CAT_DIM_USER + SENT_DIM + CAT_DIM_ISSUE
-model = ClickMLP(input_dim=input_dim).to(device)
-model.load_state_dict(torch.load(CLICK_MODEL_PATH, map_location=device))
-model.eval()
+    try:
+        download_from_gcs(CLICK_MODEL_PATH, GCS_BUCKET, GCS_MODEL_PATH)
+    except Exception as e:
+        print(f"[WARN] Could not download model from GCS: {e}")
+# Load model if exists
+if os.path.exists(CLICK_MODEL_PATH):
+    try:
+        input_dim = 2*EMB_DIM + CAT_DIM_USER + SENT_DIM + CAT_DIM_ISSUE
+        model = ClickMLP(input_dim=input_dim).to(device)
+        model.load_state_dict(torch.load(CLICK_MODEL_PATH, map_location=device))
+        model.eval()
+        print("[INFO] Model loaded successfully.")
+    except Exception as e:
+        print(f"[ERROR] Failed to load model: {e}")
+else:
+    print(f"[WARN] No model file at {CLICK_MODEL_PATH}. Please train first.")
 
 # -----------------------------------------
 # Flask app
@@ -172,42 +197,50 @@ app = Flask(__name__)
 def train_route():
     try:
         train_and_save_model()
+        # Reload model after training
+        global model
+        input_dim = 2*EMB_DIM + CAT_DIM_USER + SENT_DIM + CAT_DIM_ISSUE
+        model = ClickMLP(input_dim=input_dim).to(device)
+        model.load_state_dict(torch.load(CLICK_MODEL_PATH, map_location=device))
+        model.eval()
         return jsonify({"message": "training complete"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route('/set-recommand', methods=['POST'])
 def recommend_route():
+    if model is None:
+        return jsonify({"error": "No model loaded. Please train via /train-model first."}), 503
     conn = get_db_connection(); cursor = conn.cursor()
-    # load user & issue data
+    # Load data
     cursor.execute("SELECT id, gcn_vec, category_vec FROM users")
     users = {uid: (load_ndarray(g), load_ndarray(c)) for uid, g, c in cursor.fetchall()}
     cursor.execute("SELECT id, gcn_vec, sentence_embedding, category_vec FROM issues")
-    issues = {iid: (load_ndarray(g), load_ndarray(s), load_ndarray(c))
-              for iid, g, s, c in cursor.fetchall()}
+    issues = {iid: (load_ndarray(g), load_ndarray(s), load_ndarray(c)) for iid, g, s, c in cursor.fetchall()}
 
-    # clear existing recommendations
+    # Clear existing recommendations
     cursor.execute("DELETE FROM user_recommendations")
 
-    # compute and batch insert
     recs = []
     for uid, (u_g, u_c) in users.items():
-        if u_c is None: continue
+        if u_c is None:
+            continue
         feats, iids = [], []
         for iid, (i_g, i_s, i_c) in issues.items():
-            if i_s is None: continue
+            if i_s is None:
+                continue
             u_gv = u_g if u_g is not None else np.zeros(EMB_DIM)
             i_gv = i_g if i_g is not None else np.zeros(EMB_DIM)
             i_cv = i_c if i_c is not None else np.zeros(CAT_DIM_ISSUE)
             feat = np.concatenate([u_gv, u_c, i_gv, i_s, i_cv], axis=0)
             feats.append(feat); iids.append(iid)
-        if not feats: continue
+        if not feats:
+            continue
         X = torch.tensor(np.stack(feats), dtype=torch.float32).to(device)
         with torch.no_grad(): probs = model(X).cpu().numpy()
         for iid, score in zip(iids, probs):
             recs.append((uid, iid, float(score)))
 
-    # bulk insert recommendations
     if recs:
         cursor.executemany(
             "INSERT INTO user_recommendations (user_id, issue_id, score)"
