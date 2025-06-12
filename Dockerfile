@@ -70,4 +70,4 @@ USER appuser
 # Cloud Run 진입점 설정 (Gunicorn이 0.0.0.0:${PORT}에 바인딩되도록 수정)
 # Gunicorn은 기본적으로 8000번 포트를 사용하려고 하지만, Cloud Run은 $PORT 환경 변수를 통해 포트를 지정합니다.
 # 반드시 0.0.0.0:${PORT} 형식으로 바인딩해야 합니다.
-CMD ["gunicorn", "--bind", "0.0.0.0:${PORT}", "--workers", "1", "--threads", "8", "--timeout", "900", "main:app"]
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT} --workers 1 --threads 8 --timeout 900 main:app"]
