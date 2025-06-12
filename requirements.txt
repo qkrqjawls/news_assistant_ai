@@ -5,3 +5,4 @@ torch>=2.0
 numpy
 torch_geometric
 google-cloud-storage
+sklearn
