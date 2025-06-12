@@ -218,7 +218,6 @@ def arr_to_blob(arr: np.ndarray) -> bytes:
     return buf.getvalue()
 
 @app.route('/gcn-embedd', methods=['POST'])
-@app.route('/gcn-embedd', methods=['POST'])
 def set_gcn_embedding():
     conn = get_db_connection()
     cursor = conn.cursor()
