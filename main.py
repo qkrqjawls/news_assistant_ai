@@ -210,9 +210,6 @@ def recommend_route():
     conn.commit();cur.close();conn.close()
     return jsonify({"message":"recommendations updated"}),200
 
-if __name__=='__main__':
-    app.run(host='0.0.0.0',port=int(os.environ.get('PORT',8080)))
-
 from GCN_embedding import user_item_GCN_embedding
 
 def arr_to_blob(arr: np.ndarray) -> bytes:
