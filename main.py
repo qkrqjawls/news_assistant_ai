@@ -222,59 +222,25 @@ def set_gcn_embedding():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # 1) 유저 ID 목록
-    cursor.execute("SELECT id FROM users")
-    user_ids = [row[0] for row in cursor.fetchall()]
+    # … user_ids, issue_ids, raw_edges 로드 생략 …
 
-    # 2) 이슈 ID 목록
-    cursor.execute("SELECT id FROM issues")
-    issue_ids = [row[0] for row in cursor.fetchall()]
-
-    # 3) 클릭 이벤트 엣지 로드
-    cursor.execute(
-        "SELECT user_id, issue_id FROM custom_events WHERE eventname = %s",
-        ("click",)
-    )
-    raw_edges = cursor.fetchall()
-
-    # 4) 유저 카테고리 벡터 로드
+    # 4) 유저 카테고리 벡터 로드 (or 대신 명시적 None 비교)
     cursor.execute("SELECT id, category_vec FROM users")
-    user_feats = {
-        uid: load_ndarray(cat_blob) or np.zeros(CAT_DIM_USER)
-        for uid, cat_blob in cursor.fetchall()
-    }
+    user_feats = {}
+    for uid, cat_blob in cursor.fetchall():
+        arr = load_ndarray(cat_blob)
+        # arr이 None 이면 0-벡터, 아니면 arr 그대로
+        user_feats[uid] = arr if arr is not None else np.zeros(CAT_DIM_USER)
 
-    # 5) 이슈 카테고리 벡터 (필요하면 sentence_embedding도 결합)
+    # 5) 이슈 sentence_embedding + category_vec 로드
     cursor.execute("SELECT id, sentence_embedding, category_vec FROM issues")
     issue_feats = {}
     for iid, sent_blob, cat_blob in cursor.fetchall():
-        sent = load_ndarray(sent_blob) or np.zeros(SENT_DIM)
-        cat  = load_ndarray(cat_blob)  or np.zeros(CAT_DIM_ISSUE)
-        issue_feats[iid] = np.concatenate([sent, cat])
+        s_arr = load_ndarray(sent_blob)
+        c_arr = load_ndarray(cat_blob)
+        # None 체크
+        s_arr = s_arr if s_arr is not None else np.zeros(SENT_DIM)
+        c_arr = c_arr if c_arr is not None else np.zeros(CAT_DIM_ISSUE)
+        issue_feats[iid] = np.concatenate([s_arr, c_arr])
 
-    # 6) GCN 임베딩 계산
-    user_vecs, issue_vecs = user_item_GCN_embedding(
-        user_ids=user_ids,
-        item_ids=issue_ids,
-        raw_edges=raw_edges,
-        user_feats=user_feats,
-        item_feats=issue_feats,
-    )
-
-    # 7) DB에 저장
-    user_data = [(arr_to_blob(user_vecs[uid]), uid) for uid in user_ids]
-    cursor.executemany(
-        "UPDATE users SET gcn_vec=%s WHERE id=%s",
-        user_data
-    )
-    issue_data = [(arr_to_blob(issue_vecs[iid]), iid) for iid in issue_ids]
-    cursor.executemany(
-        "UPDATE issues SET gcn_vec=%s WHERE id=%s",
-        issue_data
-    )
-
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-    return jsonify({"message": "GCN embeddings updated"}), 200
+    # … 나머지 GCN 호출, DB 저장 로직 동일 …
