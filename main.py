@@ -218,36 +218,64 @@ def arr_to_blob(arr: np.ndarray) -> bytes:
     return buf.getvalue()
 
 @app.route('/gcn-embedd', methods=['POST'])
+@app.route('/gcn-embedd', methods=['POST'])
 def set_gcn_embedding():
     conn = get_db_connection()
     cursor = conn.cursor()
 
+    # 1) 유저 ID 목록
     cursor.execute("SELECT id FROM users")
-    rows = cursor.fetchall()
-    user_ids = [row[0] for row in rows]
+    user_ids = [row[0] for row in cursor.fetchall()]
 
+    # 2) 이슈 ID 목록
     cursor.execute("SELECT id FROM issues")
-    rows = cursor.fetchall()
-    issue_ids = [row[0] for row in rows]
+    issue_ids = [row[0] for row in cursor.fetchall()]
 
-    cursor.execute("SELECT user_id, issue_id FROM custom_events WHERE eventname = %s", ("click",))
-    rows = cursor.fetchall()
+    # 3) 클릭 이벤트 엣지 로드
+    cursor.execute(
+        "SELECT user_id, issue_id FROM custom_events WHERE eventname = %s",
+        ("click",)
+    )
+    raw_edges = cursor.fetchall()
 
-    raw_edges = rows
+    # 4) 유저 카테고리 벡터 로드
+    cursor.execute("SELECT id, category_vec FROM users")
+    user_feats = {
+        uid: load_ndarray(cat_blob) or np.zeros(CAT_DIM_USER)
+        for uid, cat_blob in cursor.fetchall()
+    }
 
-    user_vec, issue_vec = user_item_GCN_embedding(user_ids=user_ids, item_ids=issue_ids, raw_edges=raw_edges)
+    # 5) 이슈 카테고리 벡터 (필요하면 sentence_embedding도 결합)
+    cursor.execute("SELECT id, sentence_embedding, category_vec FROM issues")
+    issue_feats = {}
+    for iid, sent_blob, cat_blob in cursor.fetchall():
+        sent = load_ndarray(sent_blob) or np.zeros(SENT_DIM)
+        cat  = load_ndarray(cat_blob)  or np.zeros(CAT_DIM_ISSUE)
+        issue_feats[iid] = np.concatenate([sent, cat])
 
-    user_data = [(arr_to_blob(user_vec[uid]), uid) for uid in user_ids]
-    cursor.executemany("UPDATE users SET gcn_vec=%s WHERE id=%s", user_data)
+    # 6) GCN 임베딩 계산
+    user_vecs, issue_vecs = user_item_GCN_embedding(
+        user_ids=user_ids,
+        item_ids=issue_ids,
+        raw_edges=raw_edges,
+        user_feats=user_feats,
+        item_feats=issue_feats,
+    )
 
-    issue_data = [(arr_to_blob(issue_vec[iid]), iid) for iid in issue_ids]
-    cursor.executemany("UPDATE issues SET gcn_vec=%s WHERE id=%s", issue_data)
+    # 7) DB에 저장
+    user_data = [(arr_to_blob(user_vecs[uid]), uid) for uid in user_ids]
+    cursor.executemany(
+        "UPDATE users SET gcn_vec=%s WHERE id=%s",
+        user_data
+    )
+    issue_data = [(arr_to_blob(issue_vecs[iid]), iid) for iid in issue_ids]
+    cursor.executemany(
+        "UPDATE issues SET gcn_vec=%s WHERE id=%s",
+        issue_data
+    )
 
     conn.commit()
-    
     cursor.close()
     conn.close()
 
-    return jsonify({
-        "message" : "everything ok my man"
-    }), 200
+    return jsonify({"message": "GCN embeddings updated"}), 200
