@@ -149,7 +149,7 @@ def train_and_save_model():
             ng = ng if ng is not None else np.zeros(EMB_DIM)
             nc = nc if nc is not None else np.zeros(CAT_DIM_ISSUE)
             X_list.append(np.concatenate([u_g,u_c,ng,ns,nc])); y_list.append(0)
-    X = torch.tensor(np.stack(X_list),float32=True); y=torch.tensor(y_list,float32=True)
+    X = torch.tensor(np.stack(X_list),dtype=torch.float32); y=torch.tensor(y_list,dtype=torch.float32)
     from torch.utils.data import DataLoader, TensorDataset
     loader = DataLoader(TensorDataset(X,y), batch_size=BATCH_SIZE, shuffle=True)
     input_dim=2*EMB_DIM+CAT_DIM_USER+SENT_DIM+CAT_DIM_ISSUE
