@@ -398,3 +398,13 @@ def set_gcn_embedding():
     conn.close()
 
     return jsonify({"message": "GCN embeddings updated"}), 200
+
+@app.route('/sequential', methods=['POST'])
+def sequential_rout():
+    try:
+        set_gcn_embedding()
+        train_and_save_model()
+        recommend_route()
+        return jsonify({"message":"all complete"}),200
+    except Exception as e:
+        return jsonify({"error":str(e)}),500

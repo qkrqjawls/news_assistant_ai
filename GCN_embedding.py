@@ -187,6 +187,7 @@ def user_item_GCN_embedding(
             us = us.to(device)
             pos = pos.to(device)
             # negs_batch는 [B, neg_ratio] 형태로 오므로, long 타입으로 변환
+            torch.tensor(negs_batch, dtype=torch.long, device=device)
             negs_batch = negs_batch.to(device).long()
 
             optimizer.zero_grad() # 기울기 초기화
