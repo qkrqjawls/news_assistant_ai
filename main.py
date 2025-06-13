@@ -4,7 +4,7 @@ import time
 import os
 import sys
 import traceback
-
+from datetime import timezone
 import numpy as np
 import torch
 import torch.nn as nn
@@ -31,6 +31,8 @@ NUM_EPOCHS       = int(os.environ.get("NUM_EPOCHS", 5))
 LEARNING_RATE    = float(os.environ.get("LEARNING_RATE", 1e-3))
 GCS_BUCKET       = os.environ.get("GCS_BUCKET")
 GCS_MODEL_PATH   = os.environ.get("GCS_MODEL_PATH", "models/click_model.pt")
+DECAY_RATE   = float(os.environ.get("RECENCY_DECAY", 1e-6)) # 점수 7일 당 2배로 감소
+BOOST_FACTOR = float(os.environ.get("RECENCY_BOOST", 1.0))
 
 # Device 설정 (GPU 우선)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -107,8 +109,12 @@ def load_model():
             print(f"[WARN] Model download failed: {e}")
     # load if exists
     if os.path.exists(CLICK_MODEL_PATH):
+        input_dim = (
+            2*EMB_DIM
+            + (CAT_DIM_USER + 1)
+            + (SENT_DIM + CAT_DIM_ISSUE + 2)
+        )
         try:
-            input_dim = 2*EMB_DIM + CAT_DIM_USER + SENT_DIM + CAT_DIM_ISSUE
             m = ClickMLP(input_dim=input_dim).to(device)
             m.load_state_dict(torch.load(CLICK_MODEL_PATH, map_location=device))
             m.eval()
@@ -125,36 +131,75 @@ def load_model():
 # Train & save model
 # -----------------------------------------
 def train_and_save_model():
-    # prepare data
-    conn = get_db_connection(); cur = conn.cursor()
+    now_ts = time.time()  # 훈련 시점 타임스탬프
+
+    # DB에서 users, issues, events 로드
+    conn = get_db_connection()
+    cur = conn.cursor()
     cur.execute("SELECT id, gcn_vec, category_vec FROM users")
-    users = {uid: (load_ndarray(g), load_ndarray(c)) for uid,g,c in cur.fetchall()}
-    cur.execute("SELECT id, gcn_vec, sentence_embedding, category_vec FROM issues")
-    issues = {iid: (load_ndarray(g), load_ndarray(s), load_ndarray(c)) for iid,g,s,c in cur.fetchall()}
+    users = {}
+    for uid, g_blob, c_blob in cur.fetchall():
+        g_arr = load_ndarray(g_blob)
+        g = g_arr if g_arr is not None else np.zeros(EMB_DIM)
+        c_arr = load_ndarray(c_blob)
+        c = c_arr if c_arr is not None else np.zeros(CAT_DIM_USER)
+        # 유저 feature: [gcn_vec, category_vec..., now_ts]
+        users[uid] = (g, np.concatenate([c, [now_ts]]))
+
+    cur.execute("""
+        SELECT id, gcn_vec, sentence_embedding, category_vec, `date`, related_news_list
+        FROM issues
+    """)
+    issues = {}
+    for iid, g_blob, s_blob, c_blob, date_obj, rel_str in cur.fetchall():
+        g_arr = load_ndarray(g_blob)
+        g = g_arr if g_arr is not None else np.zeros(EMB_DIM)
+        s_arr = load_ndarray(s_blob)
+        s = s_arr if s_arr is not None else np.zeros(SENT_DIM)
+        c_arr = load_ndarray(c_blob)
+        c = c_arr if c_arr is not None else np.zeros(CAT_DIM_ISSUE)
+
+        # 추가 feature 계산
+        date_ts = date_obj.replace(tzinfo=timezone.utc).timestamp()
+        related_count = len(rel_str.split())
+        # 이슈 feature: [gcn_vec, sentence_emb..., category_vec..., date_ts, related_count]
+        issues[iid] = (
+            g,
+            np.concatenate([s, c, [date_ts, related_count]])
+        )
+
     cur.execute("SELECT user_id, issue_id FROM custom_events WHERE eventname='click'")
-    positives = set(cur.fetchall()); conn.close()
+    positives = set(cur.fetchall())
+    conn.close()
+
+    # 데이터셋 생성
     X_list, y_list = [], []
-    for uid,iid in positives:
-        u_g, u_c = users.get(uid,(None,None))
-        i_g, i_s, i_c = issues.get(iid,(None,None,None))
-        if u_c is None or i_s is None: continue
-        u_g = u_g if u_g is not None else np.zeros(EMB_DIM)
-        i_g = i_g if i_g is not None else np.zeros(EMB_DIM)
-        i_c = i_c if i_c is not None else np.zeros(CAT_DIM_ISSUE)
-        X_list.append(np.concatenate([u_g,u_c,i_g,i_s,i_c])); y_list.append(1)
+    for uid, iid in positives:
+        u_g, u_feat = users.get(uid, (np.zeros(EMB_DIM), np.zeros(CAT_DIM_USER+1)))
+        i_g, i_feat = issues.get(iid, (np.zeros(EMB_DIM), np.zeros(SENT_DIM+CAT_DIM_ISSUE+2)))
+        # positive sample
+        X_list.append(np.concatenate([u_g, u_feat, i_g, i_feat])); y_list.append(1)
+        # negative sampling
         for _ in range(NEG_RATIO):
-            nid = np.random.choice(list(issues));
-            if (uid,nid) in positives: continue
-            ng,ns,nc = issues[nid]
-            ng = ng if ng is not None else np.zeros(EMB_DIM)
-            nc = nc if nc is not None else np.zeros(CAT_DIM_ISSUE)
-            X_list.append(np.concatenate([u_g,u_c,ng,ns,nc])); y_list.append(0)
-    X = torch.tensor(np.stack(X_list),dtype=torch.float32); y=torch.tensor(y_list,dtype=torch.float32)
+            nid = np.random.choice(list(issues))
+            if (uid, nid) in positives: continue
+            ng, nfeat = issues[nid]
+            X_list.append(np.concatenate([u_g, u_feat, ng, nfeat])); y_list.append(0)
+
+    X = torch.tensor(np.stack(X_list), dtype=torch.float32)
+    y = torch.tensor(y_list, dtype=torch.float32)
+
+    # 모델 정의 (input_dim 은 load_model 과 동일)
+    input_dim = 2*EMB_DIM + (CAT_DIM_USER + 1) + (SENT_DIM + CAT_DIM_ISSUE + 2)
+    
+
     from torch.utils.data import DataLoader, TensorDataset
     loader = DataLoader(TensorDataset(X,y), batch_size=BATCH_SIZE, shuffle=True)
-    input_dim=2*EMB_DIM+CAT_DIM_USER+SENT_DIM+CAT_DIM_ISSUE
     m = ClickMLP(input_dim).to(device)
     opt=torch.optim.Adam(m.parameters(),lr=LEARNING_RATE); loss_fn=nn.BCELoss()
+
+    # 학습 루프
+    
     m.train()
     for e in range(NUM_EPOCHS):
         tot=0
@@ -163,7 +208,7 @@ def train_and_save_model():
             p=m(xb); l=loss_fn(p,yb)
             opt.zero_grad();l.backward();opt.step();tot+=l.item()
         print(f"Epoch{e+1}/{NUM_EPOCHS} loss={tot/len(loader):.4f}")
-    torch.save(m.state_dict(),CLICK_MODEL_PATH);
+    torch.save(m.state_dict(),CLICK_MODEL_PATH)
     print("Model saved")
     if GCS_BUCKET: upload_to_gcs(CLICK_MODEL_PATH,GCS_BUCKET,GCS_MODEL_PATH)
     # reload into memory
@@ -182,32 +227,72 @@ def train_route():
     except Exception as e:
         return jsonify({"error":str(e)}),500
 
-@app.route('/set-recommand',methods=['POST'])
+@app.route('/set-recommand', methods=['POST'])
 def recommend_route():
     if not load_model():
         return jsonify({"error":"No model available"}),503
-    conn=get_db_connection();cur=conn.cursor()
-    cur.execute("DELETE FROM user_recommendations")
-    cur.execute("SELECT id,gcn_vec,category_vec FROM users"); users={uid:(load_ndarray(g),load_ndarray(c)) for uid,g,c in cur.fetchall()}
-    cur.execute("SELECT id,gcn_vec,sentence_embedding,category_vec FROM issues"); issues={iid:(load_ndarray(g),load_ndarray(s),load_ndarray(c)) for iid,g,s,c in cur.fetchall()}
-    recs=[]
-    for uid,(ug,uc) in users.items():
-        if uc is None: continue
-        feats,iids=[],[]
-        for iid,(ig,is_,ic) in issues.items():
-            if is_ is None: continue
-            ugv=ug if ug is not None else np.zeros(EMB_DIM)
-            igv=ig if ig is not None else np.zeros(EMB_DIM)
-            icv=ic if ic is not None else np.zeros(CAT_DIM_ISSUE)
-            feats.append(np.concatenate([ugv,uc,igv,is_,icv])); iids.append(iid)
-        if not feats: continue
-        X=torch.tensor(np.stack(feats),dtype=torch.float32).to(device)
-        with torch.no_grad(): ps=model(X).cpu().numpy()
-        for iid,sc in zip(iids,ps): recs.append((uid,iid,float(sc)))
+
+    conn = get_db_connection()
+    cur  = conn.cursor()
+
+    # 1) 이슈별 날짜 로드
+    cur.execute("SELECT id, `date` FROM issues")
+    date_map = {iid: date_obj.timestamp() for iid, date_obj in cur.fetchall()}
+    now_ts = time.time()
+
+    # 2) 유저/이슈 피처 로드
+    cur.execute("SELECT id, gcn_vec, category_vec FROM users")
+    users = {uid:(load_ndarray(g), load_ndarray(c)) for uid,g,c in cur.fetchall()}
+
+    cur.execute("SELECT id, gcn_vec, sentence_embedding, category_vec FROM issues")
+    issues = {iid:(load_ndarray(g), load_ndarray(s), load_ndarray(c))
+              for iid,g,s,c in cur.fetchall()}
+
+    # 3) 모델 추론 + recency weight 적용
+    recs = []
+    for uid, (ug, uc) in users.items():
+        if uc is None: 
+            continue
+
+        feats, iids = [], []
+        for iid, (ig, is_, ic) in issues.items():
+            if is_ is None:
+                continue
+
+            # 명시적 None 체크로 결측 처리
+            ugv = ug  if ug  is not None else np.zeros(EMB_DIM)
+            igv = ig  if ig  is not None else np.zeros(EMB_DIM)
+            icv = ic  if ic  is not None else np.zeros(CAT_DIM_ISSUE)
+            # note: 'uc'와 'is_'는 이미 ndarray 여야 함
+            feats.append(np.concatenate([ugv, uc, igv, is_, icv]))
+            iids.append(iid)
+
+        if not feats:
+            continue
+
+        X = torch.tensor(np.stack(feats), dtype=torch.float32).to(device)
+        with torch.no_grad():
+            base_scores = model(X).cpu().numpy()
+
+        # recency 가중치
+        for iid, base_sc in zip(iids, base_scores):
+            age = now_ts - date_map.get(iid, now_ts)
+            recency_w = np.exp(-DECAY_RATE * age)
+            final_sc = base_sc * (1 + BOOST_FACTOR * recency_w)
+            recs.append((uid, iid, float(final_sc)))
+
+    # 4) DB 업데이트
     if recs:
-        cur.executemany("INSERT INTO user_recommendations(user_id,issue_id,score) VALUES(%s,%s,%s) "
-                        "ON DUPLICATE KEY UPDATE score=VALUES(score),updated_at=CURRENT_TIMESTAMP",recs)
-    conn.commit();cur.close();conn.close()
+        cur.executemany(
+            "INSERT INTO user_recommendations(user_id,issue_id,score) "
+            "VALUES(%s,%s,%s) "
+            "ON DUPLICATE KEY UPDATE score=VALUES(score), updated_at=CURRENT_TIMESTAMP",
+            recs
+        )
+
+    conn.commit()
+    cur.close()
+    conn.close()
     return jsonify({"message":"recommendations updated"}),200
 
 from GCN_embedding import user_item_GCN_embedding
