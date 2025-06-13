@@ -245,41 +245,58 @@ def train_route():
 @app.route('/set-recommand', methods=['POST'])
 def recommend_route():
     if not load_model():
-        return jsonify({"error":"No model available"}),503
+        return jsonify({"error": "No model available"}), 503
 
     conn = get_db_connection()
-    cur  = conn.cursor()
+    cur = conn.cursor()
 
-    # 1) 이슈별 날짜 로드
-    cur.execute("SELECT id, `date` FROM issues")
-    date_map = {iid: date_obj.timestamp() for iid, date_obj in cur.fetchall()}
+    # 1) 현재 타임스탬프
     now_ts = time.time()
 
-    # 2) 유저/이슈 피처 로드
+    # 2) 유저 피처 로드 (gcn_vec, category_vec, now_ts)
     cur.execute("SELECT id, gcn_vec, category_vec FROM users")
-    users = {uid:(load_ndarray(g), load_ndarray(c)) for uid,g,c in cur.fetchall()}
+    users = {}
+    for uid, g_blob, c_blob in cur.fetchall():
+        _ug = load_ndarray(g_blob)
+        ug = _ug if _ug is not None else np.zeros(EMB_DIM)
 
-    cur.execute("SELECT id, gcn_vec, sentence_embedding, category_vec FROM issues")
-    issues = {iid:(load_ndarray(g), load_ndarray(s), load_ndarray(c))
-              for iid,g,s,c in cur.fetchall()}
+        _uc = load_ndarray(c_blob)
+        uc_base = _uc if _uc is not None else np.zeros(CAT_DIM_USER)
+        uc = np.concatenate([uc_base, [now_ts]])
+        users[uid] = (ug, uc)
 
-    # 3) 모델 추론 + recency weight 적용
+    # 3) 이슈 피처 로드 (gcn_vec, sentence_embedding, category_vec, date_ts, related_count)
+    cur.execute("""
+        SELECT id, gcn_vec, sentence_embedding, category_vec, `date`, related_news_list
+        FROM issues
+    """)
+    issues = {}
+    for iid, g_blob, s_blob, c_blob, date_obj, rel_str in cur.fetchall():
+        _ig = load_ndarray(g_blob)
+        ig = _ig if _ig is not None else np.zeros(EMB_DIM)
+
+        _is = load_ndarray(s_blob)
+        is_vec = _is if _is is not None else np.zeros(SENT_DIM)
+
+        _ic = load_ndarray(c_blob)
+        ic_vec = _ic if _ic is not None else np.zeros(CAT_DIM_ISSUE)
+        # 훈련 시와 동일하게 타임스탬프와 관련 기사 개수 추가
+        date_ts = date_obj.replace(tzinfo=timezone.utc).timestamp()
+        related_count = len(rel_str.split()) if rel_str else 0
+        ie = np.concatenate([is_vec, ic_vec, [date_ts, related_count]])
+        issues[iid] = (ig, ie)
+
+    # 4) 모델 추론 + recency weight 적용
     recs = []
+    # issues 날짜 맵도 이미 SELECT한 date_obj로 계산할 수 있지만,
+    # recency weight 계산을 위해 다시 불러올 수도 있습니다.
+    cur.execute("SELECT id, `date` FROM issues")
+    date_map = {iid: d.replace(tzinfo=timezone.utc).timestamp() for iid, d in cur.fetchall()}
+
     for uid, (ug, uc) in users.items():
-        if uc is None: 
-            continue
-
         feats, iids = [], []
-        for iid, (ig, is_, ic) in issues.items():
-            if is_ is None:
-                continue
-
-            # 명시적 None 체크로 결측 처리
-            ugv = ug  if ug  is not None else np.zeros(EMB_DIM)
-            igv = ig  if ig  is not None else np.zeros(EMB_DIM)
-            icv = ic  if ic  is not None else np.zeros(CAT_DIM_ISSUE)
-            # note: 'uc'와 'is_'는 이미 ndarray 여야 함
-            feats.append(np.concatenate([ugv, uc, igv, is_, icv]))
+        for iid, (ig, ie) in issues.items():
+            feats.append(np.concatenate([ug, uc, ig, ie]))
             iids.append(iid)
 
         if not feats:
@@ -289,18 +306,17 @@ def recommend_route():
         with torch.no_grad():
             base_scores = model(X).cpu().numpy()
 
-        # recency 가중치
         for iid, base_sc in zip(iids, base_scores):
             age = now_ts - date_map.get(iid, now_ts)
             recency_w = np.exp(-DECAY_RATE * age)
             final_sc = base_sc * (1 + BOOST_FACTOR * recency_w)
             recs.append((uid, iid, float(final_sc)))
 
-    # 4) DB 업데이트
+    # 5) DB에 추천 점수 업데이트
     if recs:
         cur.executemany(
-            "INSERT INTO user_recommendations(user_id,issue_id,score) "
-            "VALUES(%s,%s,%s) "
+            "INSERT INTO user_recommendations(user_id, issue_id, score) "
+            "VALUES(%s, %s, %s) "
             "ON DUPLICATE KEY UPDATE score=VALUES(score), updated_at=CURRENT_TIMESTAMP",
             recs
         )
@@ -308,7 +324,7 @@ def recommend_route():
     conn.commit()
     cur.close()
     conn.close()
-    return jsonify({"message":"recommendations updated"}),200
+    return jsonify({"message": "recommendations updated"}), 200
 
 from GCN_embedding import user_item_GCN_embedding
 
