@@ -98,34 +98,40 @@ model = None
 
 def load_model():
     global model
-    # skip if already loaded
     if model is not None:
         return True
-    # download if GCS configured
+
+    # (Optional) GCS에서 모델 파일 내려받기
     if GCS_BUCKET:
         try:
             download_from_gcs(CLICK_MODEL_PATH, GCS_BUCKET, GCS_MODEL_PATH)
         except Exception as e:
             print(f"[WARN] Model download failed: {e}")
-    # load if exists
-    if os.path.exists(CLICK_MODEL_PATH):
-        input_dim = (
-            2*EMB_DIM
-            + (CAT_DIM_USER + 1)
-            + (SENT_DIM + CAT_DIM_ISSUE + 2)
-        )
-        try:
-            m = ClickMLP(input_dim=input_dim).to(device)
-            m.load_state_dict(torch.load(CLICK_MODEL_PATH, map_location=device))
-            m.eval()
-            model = m
-            print("[INFO] Model loaded.")
-            return True
-        except Exception as e:
-            print(f"[ERROR] Model load failed: {e}")
-    else:
+
+    if not os.path.exists(CLICK_MODEL_PATH):
         print(f"[INFO] No model file at {CLICK_MODEL_PATH}")
-    return False
+        return False
+
+    try:
+        # 저장된 state_dict 불러오기
+        state_dict = torch.load(CLICK_MODEL_PATH, map_location=device)
+        # 첫 번째 Linear 레이어 weight 키 찾기
+        first_key = next(k for k in state_dict if k.endswith("net.0.weight"))
+        # weight의 shape -> (hidden_dim, input_dim)
+        input_dim = state_dict[first_key].size(1)
+
+        # 모델 인스턴스 및 weight 로드
+        m = ClickMLP(input_dim=input_dim).to(device)
+        m.load_state_dict(state_dict)
+        m.eval()
+
+        model = m
+        print(f"[INFO] Model loaded with input_dim={input_dim}.")
+        return True
+
+    except Exception as e:
+        print(f"[ERROR] Model load failed: {e}")
+        return False
 
 # -----------------------------------------
 # Train & save model
@@ -185,12 +191,15 @@ def train_and_save_model():
             if (uid, nid) in positives: continue
             ng, nfeat = issues[nid]
             X_list.append(np.concatenate([u_g, u_feat, ng, nfeat])); y_list.append(0)
+    #    혹시 모를 shape 불일치 조기 검사
+    shapes = {arr.shape for arr in X_list}
+    assert len(shapes) == 1, f"Mixed feature shapes: {shapes}"
 
     X = torch.tensor(np.stack(X_list), dtype=torch.float32)
     y = torch.tensor(y_list, dtype=torch.float32)
 
     # 모델 정의 (input_dim 은 load_model 과 동일)
-    input_dim = 2*EMB_DIM + (CAT_DIM_USER + 1) + (SENT_DIM + CAT_DIM_ISSUE + 2)
+    input_dim = X.shape[1]
     
 
     from torch.utils.data import DataLoader, TensorDataset
@@ -202,16 +211,22 @@ def train_and_save_model():
     
     m.train()
     for e in range(NUM_EPOCHS):
-        tot=0
-        for xb,yb in loader:
-            xb,yb=xb.to(device),yb.to(device)
-            p=m(xb); l=loss_fn(p,yb)
-            opt.zero_grad();l.backward();opt.step();tot+=l.item()
-        print(f"Epoch{e+1}/{NUM_EPOCHS} loss={tot/len(loader):.4f}")
-    torch.save(m.state_dict(),CLICK_MODEL_PATH)
-    print("Model saved")
-    if GCS_BUCKET: upload_to_gcs(CLICK_MODEL_PATH,GCS_BUCKET,GCS_MODEL_PATH)
-    # reload into memory
+        total_loss = 0.0
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            preds = m(xb)
+            loss = loss_fn(preds, yb)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            total_loss += loss.item()
+        print(f"Epoch {e+1}/{NUM_EPOCHS} loss={total_loss/len(loader):.4f}")
+
+    torch.save(m.state_dict(), CLICK_MODEL_PATH)
+    print("[INFO] Model saved to", CLICK_MODEL_PATH)
+    if GCS_BUCKET:
+        upload_to_gcs(CLICK_MODEL_PATH, GCS_BUCKET, GCS_MODEL_PATH)
+
     load_model()
 
 # -----------------------------------------
