@@ -251,3 +251,13 @@ def set_gcn_embedding():
     return jsonify({
         "message" : "everything ok my man"
     }), 200
+
+@app.route('/combination', methods=['POST'])
+def comb():
+    try:
+        set_gcn_embedding()
+        train_and_save_model()
+        recommend_route()
+        return jsonify({"message":"training complete"}),200
+    except Exception as e:
+        return jsonify({"error":str(e)}),500
